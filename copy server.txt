@@ -1,0 +1,261 @@
+import os
+import uuid
+import subprocess
+import zipfile
+import tempfile
+from flask import Flask, request, jsonify, send_from_directory, url_for
+from flask_cors import CORS
+from PyPDF2 import PdfMerger
+from PIL import Image
+
+app = Flask(__name__)
+CORS(app)
+
+UPLOAD_FOLDER = "/tmp/uploads"
+ZIP_FOLDER = "/tmp/zips"
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(ZIP_FOLDER, exist_ok=True)
+
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp")
+
+# --- IMAGE to A4 PDF conversion ---
+def image_to_a4_pdf(input_path, output_pdf_path):
+    A4_WIDTH, A4_HEIGHT = 595, 842  # A4 size in pixels at 72 dpi
+    image = Image.open(input_path)
+
+    # Handle alpha channel by putting white background
+    if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
+        background = Image.new("RGB", image.size, (255, 255, 255))
+        background.paste(image, mask=image.split()[-1])
+        image = background
+    else:
+        image = image.convert("RGB")
+
+    image.thumbnail((A4_WIDTH, A4_HEIGHT))
+    a4_canvas = Image.new("RGB", (A4_WIDTH, A4_HEIGHT), "white")
+    x = (A4_WIDTH - image.width) // 2
+    y = (A4_HEIGHT - image.height) // 2
+    a4_canvas.paste(image, (x, y))
+    a4_canvas.save(output_pdf_path, "PDF")
+
+# --- Compress PDF using Ghostscript ---
+def compress_pdf_file(input_path, output_path, quality, file_size_bytes):
+    gs_quality_map = {
+        'low': '/screen',
+        'medium': '/ebook',
+        'high': '/prepress'
+    }
+    if quality not in gs_quality_map:
+        quality = 'medium'
+        
+    if quality == 'high' and file_size_bytes > 1 * 1024 * 1024:
+        gs_quality = '/screen'  # max compression for large files
+    else:
+        gs_quality = gs_quality_map.get(quality, '/ebook')
+
+    subprocess.run([
+        "gs",
+        "-sDEVICE=pdfwrite",
+        "-dCompatibilityLevel=1.4",
+        f"-dPDFSETTINGS={gs_quality}",  # use string directly here
+        "-dNOPAUSE",
+        "-dQUIET",
+        "-dBATCH",
+        f"-sOutputFile={output_path}",
+        input_path
+    ], check=True)
+
+
+# --- Convert endpoint ---
+@app.route('/convert', methods=['POST'])
+def convert_files():
+    if 'files' not in request.files:
+        return jsonify({"error": "No files part"}), 400
+
+    files = request.files.getlist('files')
+    if not files or files[0].filename == '':
+        return jsonify({"error": "No selected files"}), 400
+
+    pdf_files = []
+
+    for file in files:
+        original_filename = file.filename
+        filepath = os.path.join(UPLOAD_FOLDER, original_filename)
+        file.save(filepath)
+
+        name, ext = os.path.splitext(original_filename)
+        ext = ext.lower()
+
+        # IMAGE → PDF
+        if ext in IMAGE_EXTENSIONS:
+            pdf_filename = f"{name}_{uuid.uuid4().hex}.pdf"
+            pdf_path = os.path.join(UPLOAD_FOLDER, pdf_filename)
+            image_to_a4_pdf(filepath, pdf_path)
+            pdf_files.append(pdf_filename)
+            os.remove(filepath)  # remove original image after conversion
+
+        # DOCUMENT → PDF using LibreOffice
+        else:
+            command = [
+                "soffice",
+                "--headless",
+                "--convert-to", "pdf",
+                filepath,
+                "--outdir", UPLOAD_FOLDER
+            ]
+
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            if result.returncode != 0:
+                return jsonify({
+                    "error": f"Conversion failed for {original_filename}",
+                    "details": result.stderr.decode()
+                }), 500
+
+            pdf_filename = f"{name}.pdf"
+            pdf_files.append(pdf_filename)
+            os.remove(filepath)  # remove original doc after conversion
+
+    # SINGLE PDF response
+    if len(pdf_files) == 1:
+        pdf_url = url_for('download_file', filename=pdf_files[0], _external=True)
+        return jsonify({
+            "message": "Single file converted",
+            "pdf_file": pdf_files[0],
+            "pdf_url": pdf_url,
+            "files_count": len(files)
+        })
+
+    # MULTIPLE PDFs → ZIP
+    zip_id = uuid.uuid4().hex
+    zip_filename = f"converted_{zip_id}.zip"
+    zip_path = os.path.join(ZIP_FOLDER, zip_filename)
+
+    with zipfile.ZipFile(zip_path, 'w') as zipf:
+        for pdf in pdf_files:
+            pdf_path = os.path.join(UPLOAD_FOLDER, pdf)
+            zipf.write(pdf_path, arcname=pdf)
+            os.remove(pdf_path)  # remove PDF after zipping
+
+    zip_url = url_for('download_zip', filename=zip_filename, _external=True)
+
+    return jsonify({
+        "message": "Multiple files converted and zipped",
+        "zip_file": zip_filename,
+        "zip_url": zip_url,
+        "files_count": len(files)
+    })
+
+# --- Merge endpoint ---
+@app.route('/merge', methods=['POST'])
+def merge_pdfs():
+    if 'files' not in request.files:
+        return jsonify({"error": "No files part"}), 400
+
+    files = request.files.getlist('files')
+    if not files or files[0].filename == '':
+        return jsonify({"error": "No selected files"}), 400
+
+    merger = PdfMerger()
+
+    try:
+        for file in files:
+            original_filename = file.filename
+            filepath = os.path.join(UPLOAD_FOLDER, original_filename)
+            file.save(filepath)
+            merger.append(filepath)
+            os.remove(filepath)  # remove file after adding
+
+        merged_pdf_filename = f"merged_{uuid.uuid4().hex}.pdf"
+        merged_pdf_path = os.path.join(UPLOAD_FOLDER, merged_pdf_filename)
+        merger.write(merged_pdf_path)
+        merger.close()
+
+        pdf_url = url_for('download_file', filename=merged_pdf_filename, _external=True)
+
+        return jsonify({
+            "message": "PDFs merged successfully",
+            "pdf_file": merged_pdf_filename,
+            "pdf_url": pdf_url,
+            "files_count": len(files)
+        })
+
+    except Exception as e:
+        return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
+
+# --- Compress endpoint ---
+@app.route('/compress', methods=['POST'])
+def compress():
+    if 'files' not in request.files:
+        return jsonify({"error": "No files part"}), 400
+
+    files = request.files.getlist('files')
+    if not files or files[0].filename == '':
+        return jsonify({"error": "No selected file"}), 400
+
+    file = files[0]  # get the first file
+
+    option = request.form.get('qualityOption', 'medium').lower()
+    if option not in ['low', 'medium', 'high']:
+        option = 'medium'
+
+    original_filename = file.filename
+    name, ext = os.path.splitext(original_filename)
+    compressed_filename = f"{name}_compressed.pdf"
+
+    input_path = os.path.join(UPLOAD_FOLDER, original_filename)
+    output_path = os.path.join(UPLOAD_FOLDER, compressed_filename)
+
+    file.save(input_path)
+    
+    file_size = os.path.getsize(input_path)
+
+    try:
+        compress_pdf_file(input_path, output_path, option, file_size)
+    except Exception as e:
+        return jsonify({
+            "error": "Compression failed",
+            "details": str(e)
+        }), 500
+
+    original_size = os.path.getsize(input_path) // 1024
+    compressed_size = os.path.getsize(output_path) // 1024
+
+    os.remove(input_path)
+
+    pdf_url = url_for('download_file', filename=compressed_filename, _external=True)
+
+    return jsonify({
+        "message": "PDF compressed successfully",
+        "pdf_file": compressed_filename,
+        "pdf_url": pdf_url,
+        "original_size_kb": original_size,
+        "compressed_size_kb": compressed_size,
+        "quality": option
+    })
+
+
+# --- Download routes ---
+@app.route('/download/<filename>', methods=['GET'])
+def download_file(filename):
+    return send_from_directory(
+        UPLOAD_FOLDER,
+        filename,
+        as_attachment=True
+    )
+
+@app.route('/download/zip/<filename>', methods=['GET'])
+def download_zip(filename):
+    return send_from_directory(
+        ZIP_FOLDER,
+        filename,
+        as_attachment=True
+    )
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", port=5000)
