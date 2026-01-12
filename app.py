@@ -241,15 +241,19 @@ async def protect_endpoint(request: Request, files: List[UploadFile] = File(...)
     
 #--------Split PDF Endpoint---------#
 @app.post("/split")
-async def split_endpoint(request: Request, files: List[UploadFile] = File(...), 
-                         split_checkbox: bool = Form(False), 
-                         mode: str = Form(...),
-                         page_range: str = Form(...) ):
+async def split_endpoint(
+    request: Request, 
+    files: List[UploadFile] = File(...), 
+    split_checkbox: bool = Form(False), 
+    mode: str = Form("allPages"),  # default value set here
+    page_range: str = Form("")     # you might also give a default empty string
+):
     if not files:
         return {"error": "No file provided"}
     
     splited_pdfs = []
-    print( "Mode:", mode)
+    print("Mode:", mode)
+    
     try:
         if mode == "allPages":
             for file in files:
@@ -261,8 +265,8 @@ async def split_endpoint(request: Request, files: List[UploadFile] = File(...),
                 split_files = spliter.split_pdf_custom_range(file, page_range)
                 splited_pdfs.extend(split_files)
 
-            if split_checkbox == True and len(splited_pdfs) > 1:
-                merge_splited_pdf_name = f"cloudpdf-merged-splited-pdf.pdf"
+            if split_checkbox and len(splited_pdfs) > 1:
+                merge_splited_pdf_name = "cloudpdf-merged-splited-pdf.pdf"
                 merge_split_pdf_path = os.path.join(file_manager.upload_folder, merge_splited_pdf_name)
                 
                 pdf_paths = [os.path.join(file_manager.upload_folder, f) for f in splited_pdfs]
@@ -271,28 +275,20 @@ async def split_endpoint(request: Request, files: List[UploadFile] = File(...),
                 splited_pdfs = [merge_splited_pdf_name]
                 
         if len(splited_pdfs) == 1:
-            pdf_url = str(
-                request.url_for("download_file", filename=splited_pdfs[0])
-            )
+            pdf_url = str(request.url_for("download_file", filename=splited_pdfs[0]))
             return {
                 "message": "File splitted successfully",
                 "pdf_file": splited_pdfs[0],
                 "pdf_url": pdf_url,
                 "file_count": len(splited_pdfs)
             }
-                
         else:
             zip_id = uuid.uuid4().hex
             zip_filename = f"splitted_{zip_id}.zip"
-            pdf_paths = [
-                os.path.join(file_manager.upload_folder, f)
-                for f in splited_pdfs
-            ]
+            pdf_paths = [os.path.join(file_manager.upload_folder, f) for f in splited_pdfs]
             file_manager.create_zip(pdf_paths, zip_filename)
 
-            zip_url = str(
-                request.url_for("download_zip", filename=zip_filename)
-            )
+            zip_url = str(request.url_for("download_zip", filename=zip_filename))
 
             return {
                 "message": "Files splitted successfully",
@@ -303,6 +299,7 @@ async def split_endpoint(request: Request, files: List[UploadFile] = File(...),
     except Exception as e:
         print("Error during splitting:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
+
 
  
 
