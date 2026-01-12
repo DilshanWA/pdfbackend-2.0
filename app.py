@@ -244,7 +244,7 @@ async def protect_endpoint(request: Request, files: List[UploadFile] = File(...)
 async def split_endpoint(request: Request, files: List[UploadFile] = File(...), 
                          split_checkbox: bool = Form(False), 
                          mode: str = Form(...),
-                         page_range: str = 'allPages'):
+                         page_range: str = Form(...) ):
     if not files:
         return {"error": "No file provided"}
     
